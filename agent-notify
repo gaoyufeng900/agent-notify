@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""agent-notify —— Claude Code / Codex 干完活或需要你时，经 Bark 推到 iPhone，Apple Watch 跟着震。
+
+初次使用：
+  agent-notify setup [--url https://api.day.app/<key>]   保存 Bark 推送地址并发一条测试
+  agent-notify install [claude] [codex] [--trust-codex]  给 Claude Code / Codex 装钩子（默认两个都装）
+  agent-notify uninstall [claude] [codex]                卸掉钩子
+
+日常：
+  agent-notify test             发一条测试推送
+  agent-notify off | on         静音 / 恢复
+  agent-notify status           看配置、钩子安装情况和最近日志
+
+由钩子调用（从 stdin 读事件 JSON，立刻返回，后台发送，不拖慢会话）：
+  agent-notify hook claude      Claude Code 的 Stop / Notification
+  agent-notify hook codex       Codex 的 Stop / PermissionRequest
+
+规则：
+  - 干完活：这一轮用时 >= min_seconds（默认 60 秒）才推，秒回的小问题不打扰；算不出用时就照推。
+  - 等你批准权限 / 回答问题：立刻推。Claude 的「空闲 60 秒提醒」不推（干完时已经推过）。
+  - 默认只推「会话名 + 用时」，不把回复内容发出去；要带摘要把 preview 设成 true。
+
+配置：~/.config/agent-notify/config.json，日志：~/Library/Logs/agent-notify.log（Linux 为 ~/.local/state/agent-notify/）。
+https://github.com/gaoyufeng900/agent-notify
+"""
+import glob
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+__version__ = "1.0.0"
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "agent-notify")
+CONF = os.path.join(CONF_DIR, "config.json")
+MUTE = os.path.join(CONF_DIR, "muted")
+LEGACY_BARK_CONF = os.path.join(HOME, ".config", "bark", "config.json")   # {"server": ..., "key": ...}
+if sys.platform == "darwin":
+    LOG = os.path.join(HOME, "Library", "Logs", "agent-notify.log")
+else:
+    LOG = os.path.join(HOME, ".local", "state", "agent-notify", "agent-notify.log")
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex"))
+CODEX_HOOKS = os.path.join(CODEX_HOME, "hooks.json")
+CODEX_CONFIG = os.path.join(CODEX_HOME, "config.toml")
+CLAUDE_SESSIONS = os.path.join(HOME, "Library", "Application Support", "Claude", "claude-code-sessions",
+                               "*", "*", "local_*.json")
+
+DEFAULTS = {
+    "bark_url": "",                 # https://api.day.app/<key>（Bark App 首页复制的地址）
+    "min_seconds": 60,              # 干完活：用时不到这么多秒不推
+    "level_done": "timeSensitive",  # Bark 中断级别：passive / active / timeSensitive / critical
+    "level_ask": "timeSensitive",
+    "preview": False,               # True = 正文附上最后一条回复的前 80 字（会经过 Bark 服务器）
+    "sound": "",                    # Bark 铃声名，空 = 默认
+    "tag": "",                      # 标题里的机器名，多台电脑时用来区分，例如 "老Mac"
+    "group": "",                    # Bark 分组，空 = 按 Claude / Codex 分
+    "proxy": "",                    # 直连失败后再试的代理，例如 http://127.0.0.1:7890；环境变量里的代理也会试
+}
+HOOK_EVENTS = {"claude": ["Stop", "Notification"], "codex": ["Stop", "PermissionRequest"]}
+HOOK_TIMEOUT = 15
+
+
+# ---------- 基础 ----------
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(time.strftime("[%m-%d %H:%M:%S] ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path, data, mode=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    if mode is not None:
+        os.chmod(tmp, mode)
+    with open(tmp) as f:
+        json.load(f)                      # 写坏了就不替换
+    os.replace(tmp, path)
+
+
+def backup(path):
+    if os.path.exists(path):
+        dst = "%s.bak-agent-notify-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(path, dst)
+        return dst
+    return None
+
+
+def load_conf():
+    c = dict(DEFAULTS)
+    c.update(read_json(CONF, {}) or {})
+    return c
+
+
+# ---------- Bark ----------
+
+def parse_bark_url(url):
+    """https://api.day.app/<key>[/标题/正文] -> (server, key)。"""
+    url = (url or "").strip()
+    u = urllib.parse.urlparse(url)
+    parts = [p for p in u.path.split("/") if p]
+    if u.scheme not in ("http", "https") or not u.netloc or not parts:
+        return None, None
+    return "%s://%s" % (u.scheme, u.netloc), parts[0]
+
+
+def bark_target(conf):
+    """按顺序找：环境变量 BARK_URL / BARK_KEY(+BARK_SERVER) → 配置 bark_url → ~/.config/bark/config.json。"""
+    if os.environ.get("BARK_URL"):
+        return parse_bark_url(os.environ["BARK_URL"])
+    if os.environ.get("BARK_KEY"):
+        return os.environ.get("BARK_SERVER", "https://api.day.app").rstrip("/"), os.environ["BARK_KEY"]
+    if conf.get("bark_url"):
+        return parse_bark_url(conf["bark_url"])
+    legacy = read_json(LEGACY_BARK_CONF, {}) or {}
+    if legacy.get("key"):
+        return legacy.get("server", "https://api.day.app").rstrip("/"), legacy["key"]
+    return None, None
+
+
+def proxy_attempts(conf):
+    out = [{}]                            # 先直连（api.day.app 国内可达）
+    env = {k: v for k, v in urllib.request.getproxies().items() if k in ("http", "https")}
+    if env:
+        out.append(env)
+    if conf.get("proxy"):
+        p = {"http": conf["proxy"], "https": conf["proxy"]}
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def post(conf, title, body, level, group):
+    server, key = bark_target(conf)
+    if not key:
+        log("✗ 没有 Bark 推送地址，先跑 agent-notify setup")
+        return False
+    msg = {"device_key": key, "title": title, "body": body, "group": conf.get("group") or group, "level": level}
+    if conf.get("sound"):
+        msg["sound"] = conf["sound"]
+    data = json.dumps(msg).encode()
+    for proxies in proxy_attempts(conf):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+        try:
+            req = urllib.request.Request(server + "/push", data=data,
+                                         headers={"Content-Type": "application/json; charset=utf-8"})
+            with opener.open(req, timeout=10) as r:
+                if json.loads(r.read().decode() or "{}").get("code") == 200:
+                    return True
+        except Exception as e:
+            log("  发送失败（%s）：%s" % ("代理" if proxies else "直连", type(e).__name__))
+    return False
+
+
+# ---------- 从会话记录里取信息 ----------
+
+def iso_to_epoch(s):
+    # 形如 2026-10-08T14:38:07.931Z；老版本 Python 的 fromisoformat 不认 Z 和任意位小数，手工解析
+    try:
+        import calendar
+        return calendar.timegm(time.strptime(s.rstrip("Z").split(".")[0], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def tail_records(path, max_bytes=4 * 1024 * 1024):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    if size > max_bytes:
+        lines = lines[1:]                 # 第一行可能被截断
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def claude_turn_info(transcript):
+    """(这一轮开始的时间戳, 最后一条回复文字)。这一轮从最后一条「人发出的」user 记录算起。"""
+    start, last_text = None, ""
+    try:
+        rows = tail_records(transcript)
+    except Exception:
+        return None, ""
+    for r in reversed(rows):
+        t = r.get("type")
+        if t == "assistant" and not last_text and not r.get("isSidechain"):
+            for c in (r.get("message") or {}).get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip():
+                    last_text = c["text"]
+        if t == "user" and not r.get("isSidechain") and not r.get("isMeta"):
+            content = (r.get("message") or {}).get("content")
+            if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result"
+                                                 for c in content):
+                continue                  # 工具结果也记成 user，跳过
+            start = iso_to_epoch(r.get("timestamp", ""))
+            break
+    return start, last_text
+
+
+def codex_turn_start(transcript, turn_id):
+    try:
+        rows = tail_records(transcript)
+    except Exception:
+        return None
+    for r in reversed(rows):
+        p = r.get("payload") or {}
+        if p.get("type") == "task_started" and (not turn_id or p.get("turn_id") == turn_id):
+            try:
+                return int(p.get("started_at"))
+            except Exception:
+                return iso_to_epoch(r.get("timestamp", ""))
+    return None
+
+
+def claude_session_title(session_id):
+    """Claude 桌面版侧边栏里的会话标题（命令行版没有，返回空）。"""
+    if not session_id:
+        return ""
+    for p in glob.glob(CLAUDE_SESSIONS):
+        d = read_json(p, {}) or {}
+        if d.get("cliSessionId") == session_id:
+            return d.get("title") or ""
+    return ""
+
+
+def place_name(cwd):
+    name = os.path.basename((cwd or "").rstrip("/"))
+    if not name or name.startswith("scratch-"):
+        return ""
+    return name
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "%d 秒" % sec
+    if sec < 3600:
+        return "%d 分 %d 秒" % (sec // 60, sec % 60)
+    return "%d 小时 %d 分" % (sec // 3600, sec % 3600 // 60)
+
+
+def one_line(s, n=80):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n] + "…"
+
+
+# ---------- 决定推不推、推什么 ----------
+
+def build(agent, ev, conf, now=None):
+    """返回 ((title, body, level), None) 或 (None, 跳过原因)。"""
+    now = time.time() if now is None else now
+    event = ev.get("hook_event_name", "")
+    who = "Claude" if agent == "claude" else "Codex"
+    if conf.get("tag"):
+        who = "[%s] %s" % (conf["tag"], who)
+    name = ((claude_session_title(ev.get("session_id")) if agent == "claude" else "")
+            or place_name(ev.get("cwd")) or "临时会话")
+
+    if event == "Stop":
+        if ev.get("stop_hook_active"):
+            return None, "stop_hook_active"
+        tp = ev.get("transcript_path") or ""
+        last = ev.get("last_assistant_message") or ""
+        if agent == "claude":
+            start, text = claude_turn_info(tp) if tp else (None, "")
+            last = last or text
+        else:
+            start = codex_turn_start(tp, ev.get("turn_id")) if tp else None
+        elapsed = now - start if start else None
+        if elapsed is not None and elapsed < float(conf["min_seconds"]):
+            return None, "用时 %.0f 秒 < %s 秒" % (elapsed, conf["min_seconds"])
+        body = "用时 " + fmt_dur(elapsed) if elapsed is not None else "这一轮结束了"
+        if conf.get("preview") and last:
+            body += "\n" + one_line(last)
+        return ("✅ %s 干完了 · %s" % (who, name), body, conf["level_done"]), None
+
+    if event == "Notification":           # Claude
+        ntype = ev.get("notification_type") or ""
+        msg = ev.get("message") or ""
+        if ntype == "idle_prompt" or "waiting for your input" in msg.lower():
+            return None, "空闲提醒"
+        if ntype == "auth_success":
+            return None, ntype
+        return ("🔔 %s 在等你 · %s" % (who, name), one_line(msg, 120) or "需要你确认", conf["level_ask"]), None
+
+    if event == "PermissionRequest":      # Codex
+        tool = ev.get("tool_name") or ""
+        return ("🔔 %s 在等你批准 · %s" % (who, name), ("要用 " + tool) if tool else "需要你确认",
+                conf["level_ask"]), None
+
+    return None, "不处理的事件 " + event
+
+
+def detach():
+    """父进程立刻返回给钩子；子进程脱离会话在后台发送。"""
+    if not hasattr(os, "fork"):
+        return
+    try:
+        if os.fork() > 0:
+            os._exit(0)
+    except OSError:
+        return                            # fork 失败就前台发，最多十几秒
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+
+
+def run_hook(agent):
+    raw = sys.stdin.read()
+    try:
+        ev = json.loads(raw or "{}")
+    except Exception:
+        log("✗ %s 钩子输入不是 JSON" % agent)
+        return
+    if os.path.exists(MUTE):
+        return
+    conf = load_conf()
+    try:
+        res, why = build(agent, ev, conf)
+    except Exception as e:
+        log("✗ %s %s 处理出错：%r" % (agent, ev.get("hook_event_name"), e))
+        return
+    if res is None:
+        log("- %s %s 跳过：%s" % (agent, ev.get("hook_event_name"), why))
+        return
+    title, body, level = res
+    if os.environ.get("AGENT_NOTIFY_FOREGROUND") != "1":
+        detach()
+    ok = post(conf, title, body, level, "Claude" if agent == "claude" else "Codex")
+    log(("✓ " if ok else "✗ 没送达 ") + title + " | " + body.replace("\n", " / "))
+
+
+# ---------- 安装 / 卸载 ----------
+
+def self_path():
+    return os.path.realpath(os.path.abspath(sys.argv[0]))
+
+
+def hook_command(agent, script=None):
+    return "%s hook %s" % (shlex.quote(script or self_path()), agent)
+
+
+def is_our_hook(h, agent):
+    """命令形如 `<路径>/agent-notify hook <agent>`；路径可能带引号（含空格时）。"""
+    try:
+        parts = shlex.split(h.get("command") or "")
+    except ValueError:
+        return False
+    return len(parts) >= 3 and os.path.basename(parts[-3]) == "agent-notify" and parts[-2:] == ["hook", agent]
+
+
+def add_hooks(path, agent, script=None):
+    """把钩子加进 Claude settings.json / Codex hooks.json，已存在则跳过。返回新加的事件名。"""
+    d = read_json(path, None)
+    if d is None:
+        if os.path.exists(path):
+            raise SystemExit("%s 不是合法 JSON，没有改动" % path)
+        d = {}
+    hooks = d.setdefault("hooks", {})
+    added = []
+    for ev in HOOK_EVENTS[agent]:
+        groups = hooks.setdefault(ev, [])
+        if any(is_our_hook(h, agent) for g in groups for h in g.get("hooks", [])):
+            continue
+        groups.append({"hooks": [{"type": "command", "command": hook_command(agent, script),
+                                  "timeout": HOOK_TIMEOUT}]})
+        added.append(ev)
+    if added:
+        backup(path)
+        write_json(path, d)
+    return added
+
+
+def remove_hooks(path, agent):
+    d = read_json(path, None)
+    if not d:
+        return []
+    removed = []
+    for ev, groups in list((d.get("hooks") or {}).items()):
+        keep = []
+        for g in groups:
+            hs = [h for h in g.get("hooks", []) if not is_our_hook(h, agent)]
+            if len(hs) != len(g.get("hooks", [])):
+                removed.append(ev)
+            if hs:
+                g = dict(g, hooks=hs)
+                keep.append(g)
+        d["hooks"][ev] = keep
+        if not keep:
+            del d["hooks"][ev]
+    if removed:
+        backup(path)
+        write_json(path, d)
+    return sorted(set(removed))
+
+
+def find_codex():
+    cands = [os.environ.get("CODEX_BIN"), shutil.which("codex"),
+             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+             "/Applications/ChatGPT.app/Contents/Resources/codex",
+             "/Applications/Codex.app/Contents/Resources/codex"]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def codex_hooks_list(codex):
+    """经 `codex app-server`（stdio JSON-RPC）读出钩子列表，含 currentHash / trustStatus。"""
+    p = subprocess.Popen([codex, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, cwd=HOME)
+    lines = []
+    threading.Thread(target=lambda: [lines.append(l) for l in p.stdout], daemon=True).start()
+
+    def call(i, method, params=None):
+        msg = {"method": method, "id": i}
+        if params is not None:
+            msg["params"] = params
+        p.stdin.write(json.dumps(msg) + "\n")
+        p.stdin.flush()
+        end = time.time() + 60
+        while time.time() < end:
+            while lines:
+                try:
+                    m = json.loads(lines.pop(0))
+                except Exception:
+                    continue
+                if m.get("id") == i:
+                    if "error" in m:
+                        raise RuntimeError(m["error"])
+                    return m.get("result")
+            time.sleep(0.1)
+        raise RuntimeError("codex app-server 没有回应 " + method)
+
+    try:
+        call(1, "initialize", {"clientInfo": {"name": "agent-notify", "version": __version__}})
+        p.stdin.write(json.dumps({"method": "initialized"}) + "\n")
+        p.stdin.flush()
+        res = call(2, "hooks/list", {"cwds": [HOME]})
+    finally:
+        p.terminate()
+    out = []
+    for entry in (res or {}).get("data", []):
+        out.extend(entry.get("hooks", []))
+    return out
+
+
+def toml_set_trust(text, key, digest):
+    """在 config.toml 里设置 [hooks.state."<key>"] trusted_hash，有就改、没有就追加。"""
+    header = "[hooks.state.%s]" % json.dumps(key, ensure_ascii=False)
+    line = 'trusted_hash = "%s"' % digest
+    lines = text.split("\n")
+    for i, l in enumerate(lines):
+        if l.strip() == header:
+            j = i + 1
+            while j < len(lines) and not lines[j].lstrip().startswith("["):
+                if lines[j].strip().startswith("trusted_hash"):
+                    lines[j] = line
+                    return "\n".join(lines)
+                j += 1
+            lines.insert(i + 1, line)
+            return "\n".join(lines)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + "\n%s\n%s\n" % (header, line)
+
+
+def trust_codex():
+    codex = find_codex()
+    if not codex:
+        print("  找不到 codex 可执行文件（可用环境变量 CODEX_BIN 指定），没有信任钩子")
+        return False
+    try:
+        entries = codex_hooks_list(codex)
+    except Exception as e:
+        print("  读取 Codex 钩子列表失败：%s" % e)
+        return False
+    todo = [e for e in entries if is_our_hook(e, "codex") and e.get("trustStatus") != "trusted"]
+    if not todo:
+        print("  Codex 里的 agent-notify 钩子已全部信任")
+        return True
+    text = ""
+    if os.path.exists(CODEX_CONFIG):
+        with open(CODEX_CONFIG) as f:
+            text = f.read()
+    for e in todo:
+        text = toml_set_trust(text, e["key"], e["currentHash"])
+    backup(CODEX_CONFIG)
+    with open(CODEX_CONFIG + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(CODEX_CONFIG + ".tmp", CODEX_CONFIG)
+    left = [e["key"] for e in codex_hooks_list(codex)
+            if is_our_hook(e, "codex") and e.get("trustStatus") != "trusted"]
+    for e in todo:
+        print("  已信任 %s" % e["key"])
+    if left:
+        print("  ⚠ 仍未信任：%s" % ", ".join(left))
+    return not left
+
+
+def codex_hooks_feature_on():
+    try:
+        with open(CODEX_CONFIG) as f:
+            text = f.read()
+    except Exception:
+        return False
+    in_features = False
+    for l in text.splitlines():
+        s = l.strip()
+        if s.startswith("["):
+            in_features = s == "[features]"
+        elif in_features and s.replace(" ", "") in ("hooks=true", "codex_hooks=true"):
+            return True
+    return False
+
+
+def parse_targets(args):
+    targets = [a for a in args if a in ("claude", "codex")]
+    return targets or ["claude", "codex"]
+
+
+def cmd_install(args):
+    targets = parse_targets(args)
+    script = self_path()
+    if "claude" in targets:
+        if os.path.isdir(os.path.dirname(CLAUDE_SETTINGS)):
+            added = add_hooks(CLAUDE_SETTINGS, "claude", script)
+            print("Claude Code：" + ("已添加 " + "、".join(added) if added else "钩子已存在"))
+            print("  新开的会话生效")
+        else:
+            print("Claude Code：没找到 ~/.claude，跳过")
+    if "codex" in targets:
+        if os.path.isdir(CODEX_HOME):
+            added = add_hooks(CODEX_HOOKS, "codex", script)
+            print("Codex：" + ("已添加 " + "、".join(added) if added else "钩子已存在"))
+            if not codex_hooks_feature_on():
+                print("  ⚠ 没看到 Codex 的 hooks 功能开关：在 %s 的 [features] 里加 hooks = true" % CODEX_CONFIG)
+            if "--trust-codex" in args:
+                trust_codex()
+            else:
+                print("  Codex 只运行被信任的钩子：在 Codex 里用 /hooks 信任这两条，")
+                print("  或者重跑 agent-notify install codex --trust-codex 让本工具代为信任")
+        else:
+            print("Codex：没找到 %s，跳过" % CODEX_HOME)
+    if not bark_target(load_conf())[1]:
+        print("还没配置 Bark：agent-notify setup")
+    return 0
+
+
+def cmd_uninstall(args):
+    for agent in parse_targets(args):
+        path = CLAUDE_SETTINGS if agent == "claude" else CODEX_HOOKS
+        removed = remove_hooks(path, agent)
+        print("%s：%s" % ("Claude Code" if agent == "claude" else "Codex",
+                         "已移除 " + "、".join(removed) if removed else "没有装过"))
+    return 0
+
+
+def cmd_setup(args):
+    url = args[args.index("--url") + 1] if "--url" in args and args.index("--url") + 1 < len(args) else ""
+    while not url:
+        try:
+            url = input("粘贴 Bark App 首页的推送地址（https://api.day.app/...）：").strip()
+        except EOFError:
+            return 2
+    # 允许整段粘贴：从里面找出第一个链接
+    for tok in url.replace("“", " ").replace("”", " ").replace('"', " ").split():
+        if tok.startswith("http"):
+            url = tok
+            break
+    server, key = parse_bark_url(url)
+    if not key:
+        print("没认出推送地址，应形如 https://api.day.app/<key>")
+        return 2
+    conf = read_json(CONF, {}) or {}
+    conf["bark_url"] = "%s/%s" % (server, key)
+    write_json(CONF, conf, mode=0o600)
+    print("已保存到 %s（key %s…%s）" % (CONF, key[:3], key[-2:]))
+    return cmd_test()
+
+
+def cmd_test():
+    conf = load_conf()
+    title = "✅ 测试 · agent-notify" + (" · " + conf["tag"] if conf.get("tag") else "")
+    ok = post(conf, title, "收到这条、手表震了，就说明装好了（%s）" % time.strftime("%H:%M:%S"),
+              conf["level_done"], "Claude")
+    print("已送达 Bark" if ok else "没送达，看 " + LOG)
+    return 0 if ok else 1
+
+
+def cmd_status():
+    conf = load_conf()
+    server, key = bark_target(conf)
+    print("agent-notify %s" % __version__)
+    print("推送：" + ("已静音（agent-notify on 恢复）" if os.path.exists(MUTE) else "开启"))
+    print("Bark：" + ("%s（key %s…%s）" % (server, key[:3], key[-2:]) if key else "未配置（agent-notify setup）"))
+    shown = {k: v for k, v in conf.items() if k != "bark_url"}
+    print("配置：" + json.dumps(shown, ensure_ascii=False))
+    for agent, path in (("claude", CLAUDE_SETTINGS), ("codex", CODEX_HOOKS)):
+        d = read_json(path, {}) or {}
+        evs = [ev for ev, gs in (d.get("hooks") or {}).items()
+               if any(is_our_hook(h, agent) for g in gs for h in g.get("hooks", []))]
+        print("%s 钩子：%s" % ("Claude Code" if agent == "claude" else "Codex", "、".join(evs) or "未安装"))
+    try:
+        with open(LOG) as f:
+            print("最近日志：\n" + "".join(f.readlines()[-10:]).rstrip())
+    except Exception:
+        print("还没有日志")
+    return 0
+
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    if cmd == "hook" and len(argv) >= 2 and argv[1] in ("claude", "codex"):
+        try:
+            run_hook(argv[1])
+        except Exception as e:            # 钩子永远不能把会话搞坏
+            log("✗ 意外错误：%r" % e)
+        return 0
+    if cmd == "install":
+        return cmd_install(argv[1:])
+    if cmd == "uninstall":
+        return cmd_uninstall(argv[1:])
+    if cmd == "setup":
+        return cmd_setup(argv[1:])
+    if cmd == "test":
+        return cmd_test()
+    if cmd in ("off", "on"):
+        os.makedirs(CONF_DIR, exist_ok=True)
+        if cmd == "off":
+            open(MUTE, "w").close()
+            print("已静音（agent-notify on 恢复）")
+        else:
+            if os.path.exists(MUTE):
+                os.remove(MUTE)
+            print("已恢复推送")
+        return 0
+    if cmd == "status":
+        return cmd_status()
+    if cmd in ("--version", "-V", "version"):
+        print(__version__)
+        return 0
+    print(__doc__)
+    return 0 if cmd in ("", "-h", "--help", "help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
